@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Boule à pics</title>
+<style>
+:root{--bg:#f1f1f3;--panel:#000000;--text:#000000;--muted:#000000;--accent:#b70049;--line:#000000;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#000000;--panel:#000000;--text:#f0f0f4;--muted:rgb(255, 255, 255);--line:#37373f}}
+:root[data-theme="dark"]{--bg:#000000;--panel:#000000;--text:#f0f0f4;--muted:#ffffff;--line:black}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font-family:"Helvetica";display:flex;flex-direction:column}
+#view{flex:1;min-height:0;position:relative;touch-action:none;cursor:grab}
+#view canvas{display:block;width:100%;height:100%}
+#hint{position:absolute;left:12px;top:12px;font-size:12px;color:var(--muted)}
+#panel{background:var(--panel);border-top:1px solid var(--line);padding:14px 18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 24px;max-height:42vh;overflow-y:auto}
+.row label{display:flex;justify-content:space-between;font-size:13px;color:var(--muted);margin-bottom:4px}
+.row output{color:var(--text);font-variant-numeric:tabular-nums;font-weight:600}
+input[type=range]{width:100%;accent-color:var(--accent)}
+.bake{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:10px;align-items:center;border-top:1px solid var(--line);padding-top:10px}
+.bake button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
+.bake button:disabled{opacity:.6;cursor:wait}
+.bake select{font-size:13px;padding:6px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--text)}
+.bake span{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div id="view"><div id="hint">Glisser : tourner · Molette : zoom · aperçu rapide pendant le réglage, haute qualité au relâchement</div></div>
+<div id="panel"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const params = [
+{k:'diam', label:'Sphere diameter', min:8, max:15, step:1, v:10},
+  {k:'count', label:'Number of spikes', min:0, max:90, step:1, v:33},
+  {k:'seed', label:'Seed', min:0, max:99, step:1, v:9},
+  {k:'lmax', label:'Maximal length', min:1.5, max:6, step:0.5, v:2.5},
+  {k:'lmin', label:'Minimal length', min:0.5, max:1.5, step:0.5, v:1},
+  {k:'width', label:'Spikes base width', min:1, max:2, step:0.1, v:1},
+  {k:'tip', label:'Taille du bout du pic', min:0.26, max:0.5, step:0.02, v:0.26},
+  {k:'blend', label:'Fusion (rayon de raccord)', min:0.3, max:1.2, step:0.1, v:0.5},
+  {k:'gloss', label:'Aspect : mat ↔ brillant', min:0, max:100, step:1, v:70}
+];
+const P = {};
+const panel = document.getElementById('panel');
+let timer = null;
+params.forEach(p => {
+  P[p.k] = p.v;
+  const row = document.createElement('div'); row.className = 'row';
+  row.innerHTML = `<label><span>${p.label}</span><output>${p.v}</output></label><input type="range" min="${p.min}" max="${p.max}" step="${p.step}" value="${p.v}">`;
+  const inp = row.querySelector('input'), out = row.querySelector('output');
+  inp.addEventListener('input', () => {
+    P[p.k] = parseFloat(inp.value); out.textContent = inp.value;
+    if (p.k === 'gloss') { applyGloss(); return; }
+    build(70); clearTimeout(timer); timer = setTimeout(() => build(150), 220);
+  });
+  panel.appendChild(row);
+});
+
+const view = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+view.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, 1, 1, 2000);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x6a3045, 0.9));
+const key = new THREE.DirectionalLight(0xffffff, 0.9); key.position.set(-120, 160, 200); scene.add(key);
+const rim = new THREE.DirectionalLight(0xffffff, 0.3); rim.position.set(150, -50, -150); scene.add(rim);
+const mat = new THREE.MeshStandardMaterial({color:0xb3093c, roughness:0.3, metalness:0.05});
+function applyGloss() { const g = P.gloss / 100; mat.roughness = 0.95 - 0.92 * g; mat.metalness = 0.1 * g; }
+
+function rng(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
+
+// ---------- champ de distance (SDF) avec union lisse ----------
+let F = null, mesh = null, lastMesh = null;
+function smin(a, b, k) { const h = Math.max(k - Math.abs(a - b), 0) / k; return Math.min(a, b) - h * h * k * 0.25; }
+
+function addRoundCone(F, n, org, cs, A, u, l, r1, r2, k) {
+  const B = [A[0] + u[0] * l, A[1] + u[1] * l, A[2] + u[2] * l], pad = r1 + k + cs * 2;
+  const lo = [0,1,2].map(i => Math.max(0, Math.floor((Math.min(A[i], B[i]) - pad - org) / cs)));
+  const hi = [0,1,2].map(i => Math.min(n - 1, Math.ceil((Math.max(A[i], B[i]) + pad - org) / cs)));
+  const rr = r1 - r2, a2 = l * l - rr * rr;
+  for (let iz = lo[2]; iz <= hi[2]; iz++) { const pz = org + iz * cs - A[2];
+    for (let iy = lo[1]; iy <= hi[1]; iy++) { const py = org + iy * cs - A[1];
+      let idx = lo[0] + n * (iy + n * iz);
+      for (let ix = lo[0]; ix <= hi[0]; ix++, idx++) {
+        const px = org + ix * cs - A[0];
+        const y = px * u[0] + py * u[1] + pz * u[2];
+        const qx = px - y * u[0], qy = py - y * u[1], qz = pz - y * u[2];
+        const q2 = qx * qx + qy * qy + qz * qz, z = y - l, kk = rr * rr * q2;
+        let d;
+        if (z > 0 && a2 * z * z > kk) d = Math.sqrt(q2 + z * z) - r2;
+        else if (y < 0 || a2 * y * y < kk) d = Math.sqrt(q2 + y * y) - r1;
+        else d = (Math.sqrt(q2 * a2) + y * rr) / l - r1;
+        F[idx] = smin(F[idx], d, k);
+      }
+    }
+  }
+}
+
+function addTorus(F, n, org, cs, cy, rr, tube, k) {
+  const ex = rr + tube + k + cs * 2, ez = tube + k + cs * 2;
+  const x0 = Math.max(0, Math.floor((-ex - org) / cs)), x1 = Math.min(n - 1, Math.ceil((ex - org) / cs));
+  const y0 = Math.max(0, Math.floor((cy - ex - org) / cs)), y1 = Math.min(n - 1, Math.ceil((cy + ex - org) / cs));
+  const z0 = Math.max(0, Math.floor((-ez - org) / cs)), z1 = Math.min(n - 1, Math.ceil((ez - org) / cs));
+  for (let iz = z0; iz <= z1; iz++) { const pz = org + iz * cs;
+    for (let iy = y0; iy <= y1; iy++) { const py = org + iy * cs - cy;
+      for (let ix = x0; ix <= x1; ix++) {
+        const px = org + ix * cs, a = Math.sqrt(px * px + py * py) - rr;
+        const d = Math.sqrt(a * a + pz * pz) - tube, i = ix + n * (iy + n * iz);
+        F[i] = smin(F[i], d, k);
+      }
+    }
+  }
+}
+
+// ---------- extraction de surface (surface nets) + projection lisse ----------
+const CO = [[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,0,1],[1,0,1],[0,1,1],[1,1,1]];
+const ED = [[0,1],[2,3],[4,5],[6,7],[0,2],[1,3],[4,6],[5,7],[0,4],[1,5],[2,6],[3,7]];
+
+function extract(F, n, org, cs) {
+  const res = n - 1, nn = n * n;
+  const vmap = new Int32Array(res * res * res).fill(-1);
+  const off = [0, 1, n, n + 1, nn, nn + 1, nn + n, nn + n + 1];
+  const P3 = [], v = new Float32Array(8);
+  for (let z = 0; z < res; z++) for (let y = 0; y < res; y++) for (let x = 0; x < res; x++) {
+    const i = x + n * (y + n * z);
+    let neg = 0;
+    for (let c = 0; c < 8; c++) { v[c] = F[i + off[c]]; if (v[c] < 0) neg++; }
+    if (neg === 0 || neg === 8) continue;
+    let sx = 0, sy = 0, sz = 0, cnt = 0;
+    for (let e = 0; e < 12; e++) {
+      const a = ED[e][0], b = ED[e][1];
+      if ((v[a] < 0) !== (v[b] < 0)) {
+        const t = v[a] / (v[a] - v[b]);
+        sx += CO[a][0] + t * (CO[b][0] - CO[a][0]);
+        sy += CO[a][1] + t * (CO[b][1] - CO[a][1]);
+        sz += CO[a][2] + t * (CO[b][2] - CO[a][2]);
+        cnt++;
+      }
+    }
+    vmap[x + res * (y + res * z)] = P3.length / 3;
+    P3.push(x + sx / cnt, y + sy / cnt, z + sz / cnt);
+  }
+  const vm = (x, y, z) => vmap[x + res * (y + res * z)];
+  const I = [];
+  const quad = (c0, c1, c2, c3, ccw) => { if (ccw) I.push(c0, c1, c2, c0, c2, c3); else I.push(c0, c2, c1, c0, c3, c2); };
+  for (let z = 0; z < res; z++) for (let y = 0; y < res; y++) for (let x = 0; x < res; x++) {
+    const i = x + n * (y + n * z), a = F[i];
+    if (y > 0 && z > 0) { const b = F[i + 1]; if ((a < 0) !== (b < 0)) quad(vm(x,y-1,z-1), vm(x,y,z-1), vm(x,y,z), vm(x,y-1,z), a < 0); }
+    if (x > 0 && z > 0) { const b = F[i + n]; if ((a < 0) !== (b < 0)) quad(vm(x-1,y,z-1), vm(x,y,z-1), vm(x,y,z), vm(x-1,y,z), a >= 0); }
+    if (x > 0 && y > 0) { const b = F[i + nn]; if ((a < 0) !== (b < 0)) quad(vm(x-1,y-1,z), vm(x,y-1,z), vm(x,y,z), vm(x-1,y,z), a < 0); }
+  }
+  // échantillonnage trilinéaire pour affiner position et normales
+  const lim = res - 0.001;
+  const samp = (gx, gy, gz) => {
+    gx = Math.min(Math.max(gx, 0), lim); gy = Math.min(Math.max(gy, 0), lim); gz = Math.min(Math.max(gz, 0), lim);
+    const x = gx | 0, y = gy | 0, z = gz | 0, fx = gx - x, fy = gy - y, fz = gz - z, i = x + n * (y + n * z);
+    const c00 = F[i] * (1 - fx) + F[i + 1] * fx, c10 = F[i + n] * (1 - fx) + F[i + n + 1] * fx;
+    const c01 = F[i + nn] * (1 - fx) + F[i + nn + 1] * fx, c11 = F[i + nn + n] * (1 - fx) + F[i + nn + n + 1] * fx;
+    return (c00 * (1 - fy) + c10 * fy) * (1 - fz) + (c01 * (1 - fy) + c11 * fy) * fz;
+  };
+  const nv = P3.length / 3, pos = new Float32Array(nv * 3), nor = new Float32Array(nv * 3), e = 0.7;
+  for (let k = 0; k < nv; k++) {
+    let gx = P3[k*3], gy = P3[k*3+1], gz = P3[k*3+2];
+    for (let it = 0; it < 2; it++) {
+      const f = samp(gx, gy, gz);
+      let nx = samp(gx+e,gy,gz) - samp(gx-e,gy,gz), ny = samp(gx,gy+e,gz) - samp(gx,gy-e,gz), nz = samp(gx,gy,gz+e) - samp(gx,gy,gz-e);
+      const L = Math.hypot(nx, ny, nz) || 1; nx /= L; ny /= L; nz /= L;
+      const s = Math.max(-1, Math.min(1, f / cs));
+      gx -= nx * s; gy -= ny * s; gz -= nz * s;
+      nor[k*3] = nx; nor[k*3+1] = ny; nor[k*3+2] = nz;
+    }
+    pos[k*3] = org + gx * cs; pos[k*3+1] = org + gy * cs; pos[k*3+2] = org + gz * cs;
+  }
+  return {pos, nor, idx: new Uint32Array(I)};
+}
+
+const RING_R = 1.5, RING_TUBE = 0.5; // anneau : taille fixe (rayon moyen et épaisseur), indépendante de la sphère
+function build(res) {
+  const R = P.diam / 2, lo = Math.min(P.lmin, P.lmax), hi = Math.max(P.lmin, P.lmax);
+  const k = Math.max(P.blend, 0.05);
+  const rand = rng(P.seed * 7919 + 13);
+  const sp = []; let maxExt = R;
+  for (let i = 0; i < P.count; i++) {
+    let y, phi;
+    do { y = rand() * 2 - 1; phi = rand() * Math.PI * 2; } while (y > 0.9);
+    const r = Math.sqrt(1 - y * y);
+    const len = lo + rand() * (hi - lo), w = P.width * (0.55 + 0.45 * rand());
+    sp.push({u:[r * Math.cos(phi), y, r * Math.sin(phi)], len, w});
+    maxExt = Math.max(maxExt, R + len);
+  }
+  const rg = RING_R, tube = RING_TUBE, cy = R + rg - tube * 0.8;
+  const E = Math.max(maxExt, cy + rg + tube) + k + 3, n = res + 1, cs = 2 * E / res, org = -E;
+  if (!F || F.length !== n * n * n) F = new Float32Array(n * n * n);
+  for (let z = 0; z < n; z++) { const z2 = (org + z * cs) ** 2;
+    for (let y = 0; y < n; y++) { const yz = z2 + (org + y * cs) ** 2; let i = n * (y + n * z);
+      for (let x = 0; x < n; x++, i++) { const px = org + x * cs; F[i] = Math.sqrt(px * px + yz) - R; } } }
+  for (const s of sp) {
+    const a0 = R * 0.92, r2 = Math.min(P.tip, s.w * 0.9);
+    const l = Math.max(R + s.len - r2 - a0, 0.2);
+    const r1 = Math.min(s.w, 0.9 * l + r2);
+    addRoundCone(F, n, org, cs, [s.u[0] * a0, s.u[1] * a0, s.u[2] * a0], s.u, l, r1, Math.min(r2, r1 * 0.95), k);
+  }
+  addTorus(F, n, org, cs, cy, rg, tube, Math.min(k, tube * 2));
+  const m = lastMesh = extract(F, n, org, cs);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(m.pos, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(m.nor, 3));
+  geo.setIndex(new THREE.BufferAttribute(m.idx, 1));
+  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
+  mesh = new THREE.Mesh(geo, mat); scene.add(mesh);
+}
+
+// ---------- bake mesh : export FBX (binaire 7.4) + OBJ dans un .zip ----------
+const te = new TextEncoder();
+function crc32(b) {
+  if (!crc32.t) { crc32.t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; crc32.t[n] = c >>> 0; } }
+  let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = crc32.t[(c ^ b[i]) & 255] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function cat(parts) { let n = 0; for (const p of parts) n += p.length; const o = new Uint8Array(n); let k = 0; for (const p of parts) { o.set(p, k); k += p.length; } return o; }
+function zip(files) {
+  const loc = [], cen = []; let off = 0, cdSize = 0;
+  for (const f of files) {
+    const nm = te.encode(f.name), crc = crc32(f.data), sz = f.data.length;
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(12, 33, true);
+    h.setUint32(14, crc, true); h.setUint32(18, sz, true); h.setUint32(22, sz, true); h.setUint16(26, nm.length, true);
+    loc.push(new Uint8Array(h.buffer), nm, f.data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(14, 33, true);
+    c.setUint32(16, crc, true); c.setUint32(20, sz, true); c.setUint32(24, sz, true); c.setUint16(28, nm.length, true); c.setUint32(42, off, true);
+    cen.push(new Uint8Array(c.buffer), nm); cdSize += 46 + nm.length; off += 30 + nm.length + sz;
+  }
+  const e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, cdSize, true); e.setUint32(16, off, true);
+  return cat([...loc, ...cen, new Uint8Array(e.buffer)]);
+}
+const I = v => ({t:'I', v}), L = v => ({t:'L', v}), D = v => ({t:'D', v}), S = v => ({t:'S', v});
+const N = (name, props = [], kids = []) => ({name, props, kids});
+function encProp(p) {
+  let b, dv;
+  switch (p.t) {
+    case 'I': b = new Uint8Array(5); dv = new DataView(b.buffer); b[0] = 73; dv.setInt32(1, p.v, true); return b;
+    case 'L': b = new Uint8Array(9); dv = new DataView(b.buffer); b[0] = 76; dv.setBigInt64(1, BigInt(p.v), true); return b;
+    case 'D': b = new Uint8Array(9); dv = new DataView(b.buffer); b[0] = 68; dv.setFloat64(1, p.v, true); return b;
+    case 'S': { const s = te.encode(p.v); b = new Uint8Array(5 + s.length); dv = new DataView(b.buffer); b[0] = 83; dv.setUint32(1, s.length, true); b.set(s, 5); return b; }
+    default: { const isD = p.t === 'd', n = p.v.length, bl = n * (isD ? 8 : 4);
+      b = new Uint8Array(13 + bl); dv = new DataView(b.buffer); b[0] = isD ? 100 : 105;
+      dv.setUint32(1, n, true); dv.setUint32(5, 0, true); dv.setUint32(9, bl, true);
+      b.set(new Uint8Array((isD ? new Float64Array(p.v) : new Int32Array(p.v)).buffer), 13); return b; }
+  }
+}
+function encNode(nd, off) {
+  const nm = te.encode(nd.name), pb = nd.props.map(encProp), pl = pb.reduce((a, b) => a + b.length, 0);
+  let o = off + 13 + nm.length + pl; const kb = [];
+  for (const k of nd.kids) { const b = encNode(k, o); kb.push(b); o += b.length; }
+  if (nd.kids.length) { kb.push(new Uint8Array(13)); o += 13; }
+  const h = new Uint8Array(13); const dv = new DataView(h.buffer);
+  dv.setUint32(0, o, true); dv.setUint32(4, nd.props.length, true); dv.setUint32(8, pl, true); h[12] = nm.length;
+  return cat([h, nm, ...pb, ...kb]);
+}
+function buildFBX(m) {
+  const nt = m.idx.length / 3, pi = new Int32Array(m.idx.length);
+  for (let t = 0; t < nt; t++) { pi[t*3] = m.idx[t*3]; pi[t*3+1] = m.idx[t*3+1]; pi[t*3+2] = -m.idx[t*3+2] - 1; }
+  const P = (...a) => N('P', a);
+  const nodes = [
+    N('FBXHeaderExtension', [], [N('FBXHeaderVersion', [I(1003)]), N('FBXVersion', [I(7400)]), N('Creator', [S('Boule a pics')])]),
+    N('GlobalSettings', [], [N('Version', [I(1000)]), N('Properties70', [], [
+      P(S('UpAxis'), S('int'), S('Integer'), S(''), I(1)), P(S('UpAxisSign'), S('int'), S('Integer'), S(''), I(1)),
+      P(S('FrontAxis'), S('int'), S('Integer'), S(''), I(2)), P(S('FrontAxisSign'), S('int'), S('Integer'), S(''), I(1)),
+      P(S('CoordAxis'), S('int'), S('Integer'), S(''), I(0)), P(S('CoordAxisSign'), S('int'), S('Integer'), S(''), I(1)),
+      P(S('UnitScaleFactor'), S('double'), S('Number'), S(''), D(0.1))])]),
+    N('Definitions', [], [N('Version', [I(100)]), N('Count', [I(3)]),
+      N('ObjectType', [S('GlobalSettings')], [N('Count', [I(1)])]), N('ObjectType', [S('Model')], [N('Count', [I(1)])]), N('ObjectType', [S('Geometry')], [N('Count', [I(1)])])]),
+    N('Objects', [], [
+      N('Geometry', [L(1000001), S('boule\0\x01Geometry'), S('Mesh')], [
+        N('Vertices', [{t:'d', v:m.pos}]), N('PolygonVertexIndex', [{t:'i', v:pi}]), N('GeometryVersion', [I(124)]),
+        N('LayerElementNormal', [I(0)], [N('Version', [I(101)]), N('Name', [S('')]), N('MappingInformationType', [S('ByVertice')]), N('ReferenceInformationType', [S('Direct')]), N('Normals', [{t:'d', v:m.nor}])]),
+        N('Layer', [I(0)], [N('Version', [I(100)]), N('LayerElement', [], [N('Type', [S('LayerElementNormal')]), N('TypedIndex', [I(0)])])])]),
+      N('Model', [L(1000002), S('boule\0\x01Model'), S('Mesh')], [N('Version', [I(232)]), N('Culling', [S('CullingOff')])])]),
+    N('Connections', [], [N('C', [S('OO'), L(1000002), L(0)]), N('C', [S('OO'), L(1000001), L(1000002)])])
+  ];
+  const parts = [te.encode('Kaydara FBX Binary  \0'), new Uint8Array([0x1a, 0x00, 0xe8, 0x1c, 0, 0])]; // v7400
+  let off = 27;
+  for (const nd of nodes) { const b = encNode(nd, off); parts.push(b); off += b.length; }
+  parts.push(new Uint8Array(13)); off += 13;
+  parts.push(new Uint8Array([0xfa,0xbc,0xab,0x09,0xd0,0xc8,0xd4,0x66,0xb1,0x76,0xfb,0x83,0x1c,0xf7,0x26,0x7e]), new Uint8Array(4)); off += 20;
+  let pad = ((off + 15) & ~15) - off; if (pad === 0) pad = 16;
+  parts.push(new Uint8Array(pad), new Uint8Array([0xe8, 0x1c, 0, 0]), new Uint8Array(120),
+    new Uint8Array([0xf8,0x5a,0x8c,0x6a,0xde,0xf5,0xd9,0x7e,0xec,0xe9,0x0c,0xe3,0x75,0x8f,0x29,0x0b]));
+  return cat(parts);
+}
+function buildOBJ(m, compact) {
+  const o = ['# Boule a pics - triangles only'], nv = m.pos.length / 3;
+  for (let i = 0; i < nv; i++) o.push('v ' + m.pos[i*3].toFixed(4) + ' ' + m.pos[i*3+1].toFixed(4) + ' ' + m.pos[i*3+2].toFixed(4));
+  if (!compact) for (let i = 0; i < nv; i++) o.push('vn ' + m.nor[i*3].toFixed(4) + ' ' + m.nor[i*3+1].toFixed(4) + ' ' + m.nor[i*3+2].toFixed(4));
+  for (let t = 0; t < m.idx.length; t += 3) { const a = m.idx[t]+1, b = m.idx[t+1]+1, c = m.idx[t+2]+1; o.push(compact ? 'f ' + a + ' ' + b + ' ' + c : 'f ' + a + '//' + a + ' ' + b + '//' + b + ' ' + c + '//' + c); }
+  return o.join('\n');
+}
+// nettoyage final : triangles uniquement, suppression des triangles dégénérés et des sommets orphelins
+function cleanMesh(m) {
+  const p = m.pos, nv = p.length / 3, map = new Int32Array(nv).fill(-1), out = []; let c = 0;
+  for (let t = 0; t + 2 < m.idx.length; t += 3) {
+    const a = m.idx[t], b = m.idx[t+1], d = m.idx[t+2];
+    if (a === b || b === d || a === d) continue;
+    const ux = p[b*3]-p[a*3], uy = p[b*3+1]-p[a*3+1], uz = p[b*3+2]-p[a*3+2];
+    const vx = p[d*3]-p[a*3], vy = p[d*3+1]-p[a*3+1], vz = p[d*3+2]-p[a*3+2];
+    const cx = uy*vz-uz*vy, cy = uz*vx-ux*vz, cz = ux*vy-uy*vx;
+    
+    for (const i of [a, b, d]) { if (map[i] < 0) map[i] = c++; out.push(map[i]); }
+  }
+  const pos = new Float32Array(c * 3), nor = new Float32Array(c * 3);
+  for (let i = 0; i < nv; i++) if (map[i] >= 0) { const j = map[i] * 3; for (let k = 0; k < 3; k++) { pos[j+k] = p[i*3+k]; nor[j+k] = m.nor[i*3+k]; } }
+  return {pos, nor, idx: new Uint32Array(out)};
+}
+(function bakeUI() {
+  const row = document.createElement('div'); row.className = 'bake'; row.hidden = true;
+  row.innerHTML = '<select><option value="150">Standard (150)</option><option value="220">Fine (220)</option></select><button>Bake mesh → FBX</button><span></span>';
+  panel.appendChild(row);
+  const sel = row.querySelector('select'), btn = row.querySelector('button'), st = row.querySelector('span');
+  let dl = null;
+  btn.onclick = async () => {
+    btn.disabled = true; st.textContent = 'Baking…';
+    await new Promise(r => setTimeout(r, 40));
+    if (!dl && window.claude) { try { const pm = await claude.use('permissions'); if (pm) { await pm.request(['downloads']); dl = await claude.use('downloads'); } } catch (e) {} }
+    try {
+      build(+sel.value); lastMesh = cleanMesh(lastMesh);
+      if (!dl) {
+        let ta = row.querySelector('textarea');
+        if (!ta) {
+          ta = document.createElement('textarea'); ta.style.cssText = 'width:100%;height:110px;font:11px monospace';
+          const cp = document.createElement('button'); cp.textContent = 'Copy OBJ';
+          cp.onclick = async () => { try { await navigator.clipboard.writeText(ta.value); st.textContent = 'Copied — paste into a file named Spikesball.obj'; } catch (e) { ta.focus(); ta.select(); document.execCommand('copy'); } };
+          row.append(cp, ta);
+        }
+        try { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([buildOBJ(lastMesh)], {type:'text/plain'})); a.download = 'Spikesball.obj'; document.body.appendChild(a); a.click(); a.remove(); } catch (e) {}
+        ta.value = buildOBJ(lastMesh, true);
+        st.textContent = 'If no .obj file was downloaded automatically, copy the OBJ text below into a file named Spikesball.obj (' + (lastMesh.idx.length / 3) + ' triangles)';
+        btn.disabled = false; build(150); return;
+      }
+      const fbx = buildFBX(lastMesh), obj = te.encode(buildOBJ(lastMesh));
+      try {
+        await dl.save({filename:'Spikesball.zip', data: zip([{name:'Spikesball.fbx', data:fbx}, {name:'Spikesball', data:obj}])});
+      } catch (e) {
+        if (e && e.code === 'declined') throw e;
+        st.textContent = 'zip refused (' + ((e && (e.code || e.message)) || e) + '), saving as .txt…';
+        await dl.save({filename:'Spikesball.fbx.txt', data:fbx});
+        await dl.save({filename:'Spikesball.obj.txt', data:obj});
+      }
+      
+      st.textContent = (lastMesh.pos.length / 3) + ' vertices · ' + (lastMesh.idx.length / 3) + ' triangles';
+    } catch (e) { st.textContent = e && e.code === 'declined' ? 'Cancelled' : 'Export failed: ' + ((e && (e.code || e.message)) || e); }
+    btn.disabled = false; build(150);
+  };
+  (async () => { try { if (window.claude) dl = await claude.use('downloads'); } catch (e) {} if (dl) row.hidden = false; })();
+})();
+
+// ---------- orbite ----------
+let theta = 0.5, phi = 1.35, dist = 66, drag = false, lx = 0, ly = 0;
+view.addEventListener('pointerdown', e => { drag = true; lx = e.clientX; ly = e.clientY; view.setPointerCapture(e.pointerId); view.style.cursor = 'grabbing'; });
+view.addEventListener('pointerup', () => { drag = false; view.style.cursor = 'grab'; });
+view.addEventListener('pointermove', e => {
+  if (!drag) return;
+  theta -= (e.clientX - lx) * 0.008; phi -= (e.clientY - ly) * 0.008;
+  phi = Math.max(0.15, Math.min(Math.PI - 0.15, phi)); lx = e.clientX; ly = e.clientY;
+});
+view.addEventListener('wheel', e => { e.preventDefault(); dist = Math.max(10, Math.min(700, dist * (1 + e.deltaY * 0.001))); }, {passive:false});
+function resize() { const w = view.clientWidth, h = view.clientHeight; renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize); new ResizeObserver(resize).observe(view);
+function loop() {
+  camera.position.set(dist * Math.sin(phi) * Math.sin(theta), dist * Math.cos(phi), dist * Math.sin(phi) * Math.cos(theta));
+  camera.lookAt(0, 6, 0); renderer.render(scene, camera); requestAnimationFrame(loop);
+}
+applyGloss(); build(70); resize(); loop(); setTimeout(() => build(150), 50);
+</script>
+</body>
+</html>
